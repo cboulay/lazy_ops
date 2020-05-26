@@ -720,11 +720,6 @@ class DatasetViewh5py(DatasetView, h5py.Dataset):
     def __getnewargs__(self):
         return (self._dataset,)
 
-    # @property
-    # def file_info(self):
-        # # Shouldn't the mixin take care of this?
-        # return self.dataset.file_info
-
 
 try:
     import zarr
