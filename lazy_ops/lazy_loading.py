@@ -23,10 +23,14 @@ for ib in view.lazy_iter(axis=1):
     print(ib[0])
 
 """
-import numpy as np
+import os
+import tempfile
+import weakref
 from abc import ABCMeta, abstractmethod
 from typing import Union
+import numpy as np
 import h5pickle as h5py
+import h5py as _h5py
 
 
 installed_dataset_types = h5py.Dataset
@@ -42,7 +46,7 @@ class DatasetView(metaclass=ABCMeta):
       The goal is to implement numpy ndarray shape manipulation methods reshape, transpose, swapaxes, squeeze:
       https://numpy.org/doc/stable/reference/arrays.ndarray.html#shape-manipulation
 
-    The internal state variables are _dset_slices, _dset_ax_splits, and _axis_map
+    The internal state variables are _dset_slices, _sliced_reshape, and _axis_map
     _dset_slices:
         Slices to apply to the dataset when returning data.
         Each element can be a slice object, an integer iterator, or a single integer.
@@ -67,9 +71,6 @@ class DatasetView(metaclass=ABCMeta):
     TODO: Maybe someday _sliced_reshape and _axis_map can be reimplemented with something like
     numpy's strides, and this can be even more flexible.
     """
-    # def __getnewargs_ex__(self):
-    #     return (), {'dataset': self._dataset, 'dataset_slices': self._dset_slices,
-    #                 'sliced_reshape': self._sliced_reshape, 'axis_map': self._axis_map}
 
     def __new__(cls,
                 dataset: installed_dataset_types = None,
@@ -86,7 +87,7 @@ class DatasetView(metaclass=ABCMeta):
           lazy object
         """
         if cls == DatasetView:
-            if isinstance(dataset, h5py.Dataset):
+            if isinstance(dataset, (h5py.Dataset, _h5py.Dataset)):
                 return DatasetViewh5py(dataset=dataset)
             elif HAVE_ZARR:
                 if isinstance(dataset, zarr.core.Array):
@@ -142,7 +143,7 @@ class DatasetView(metaclass=ABCMeta):
         if isinstance(sl, slice):
             sl_start = sl.start if sl.start is not None else 0
             sl_step = sl.step if sl.step is not None else 1
-            sl_size = 1 + (sl.stop - sl_start - 1) // sl_step if sl.stop != sl_start else 0
+            sl_size = 1 + (sl.stop - sl_start - 1) // sl_step if sl.stop > sl_start else 0
         elif isinstance(sl, int):
             sl_size = None  # Does not make it to the output
         else:  # iterator of integers
@@ -187,6 +188,19 @@ class DatasetView(metaclass=ABCMeta):
     @property
     def size(self):
         return np.prod(self.shape)
+
+    # @property
+    # def dtype(self):
+    #     return self._dataset.dtype
+
+    # @property
+    # def id(self):
+    #     return self._dataset.id
+
+    @abstractmethod
+    def get_writable_copy(self):
+        # Must be implemented in sub-classes.
+        raise NotImplementedError
 
     @classmethod
     def _slice_tuple(cls, slices_):
@@ -251,6 +265,7 @@ class DatasetView(metaclass=ABCMeta):
         """
         slices_ = list(slices_)
         with_shape = with_shape if with_shape is not None else self.dataset.shape
+        # If provided slices are incomplete then append with slice(None) for each remaining dimension
         slices_ += [slice(None)] * (len(with_shape) - len([_ for _ in slices_ if _ is not None]))
         shape_idx = 0  # Index into with_shape. Do not increment for slice == None.
         for ax, sl in enumerate(slices_):
@@ -300,6 +315,14 @@ class DatasetView(metaclass=ABCMeta):
             return new_obj
         return new_obj.dsetread()
 
+    def __setitem__(self, new_slices, value):
+        # Writing to the output of self.dsetread() doesn't actually update disk
+        # So we need to transform new value to get it suitable for updating dest_obj
+        dest_obj = self.lazy_slice[new_slices]
+        value = value.transpose(np.argsort(dest_obj._axis_map))  # inverse-transpose
+        value = value.reshape(dest_obj._sliced_shape)  # Reshape
+        dest_obj._dataset[dest_obj._dset_slices] = value[:]
+
     def lazy_iter(self, axis=0):
         """ lazy iterator over the first axis
             Modifications to the items are not stored
@@ -329,8 +352,7 @@ class DatasetView(metaclass=ABCMeta):
                 upd_sl = old_sl[new_sl]
         elif isinstance(new_sl, int):
             if new_sl >= old_len or new_sl <= ~old_len:
-                raise IndexError("Index %d out of range, dim %d of size %d"
-                                 % (new_sl, ax_ix, old_len))
+                raise IndexError("Index {} out of range, size {}".format(new_sl, old_len))
             if isinstance(old_sl, slice):
                 upd_sl = old_sl.start + old_sl.step * (new_sl % old_len)
             else:
@@ -339,21 +361,19 @@ class DatasetView(metaclass=ABCMeta):
         elif new_sl is None:
             print("This shouldn't be reached. Please notify devs if you see this.")
         else:
-            # Handle new_sl being an iterator of integers.
-            if not all(isinstance(el, int) for el in new_sl):
+            # new_sl is an list/iterator of integers or booleans.
+            if len(new_sl) > 0 and all(isinstance(el, (type(True), np.bool_)) for el in new_sl):
+                new_sl = np.array(new_sl)
                 # Convert boolean array to iterator of integers.
-                if new_sl.dtype.kind != 'b':
-                    raise ValueError("Indices must be either integers or booleans")
-                else:
-                    # boolean indexing
-                    if len(new_sl) != old_len:
-                        raise IndexError("Length of boolean index $d must be equal to size %d"
-                                         % (len(new_sl), old_len))
-                    upd_sl = new_sl.nonzero()[0]
+                if len(new_sl) != old_len:
+                    raise IndexError("Length of boolean index {} must be equal to axis size {}".format(
+                        len(new_sl), old_len))
+                new_sl = new_sl.nonzero()[0]
             if any(el >= old_len or el <= ~old_len for el in new_sl):
-                raise IndexError("Index %s out of range, of size %d"
-                                 % (str(new_sl), old_len))
-            if isinstance(old_sl, slice):
+                raise IndexError("Index {} out of range, of size {}".format(new_sl, old_len))
+            if len(new_sl) == 0:
+                upd_sl = []
+            elif isinstance(old_sl, slice):
                 upd_sl = tuple(old_sl.start + old_sl.step * (ind % old_len)
                                for ind in new_sl)
             else:
@@ -402,7 +422,7 @@ class DatasetView(metaclass=ABCMeta):
         assert reshape_ok, "It shouldn't be possible to trigger this."
 
         # Compose slices - in reverse order
-        # Any old slices that are integers will eliminate the corresponding axes before reaching reshape level.
+        # Any old slices that are integers previously eliminated axes from output and were not target of current slice.
         # So we only need to compose with old slices that are not int, but keep track of where they came from.
         dset_sl_idx = [ix for ix, _ in enumerate(self._dset_slices) if not isinstance(_, int)]
         new_dset_slices = [self._dset_slices[_] for _ in dset_sl_idx]
@@ -451,7 +471,7 @@ class DatasetView(metaclass=ABCMeta):
                         else:
                             new_reshape[r_ix] = new_iter_.shape[new_iter_ix]
                             new_iter_ix += 1
-                    sl_ax = rshp_idx[0]  # Choose firstr rshp ax so sl_ax decrement will go to new slice
+                    sl_ax = rshp_idx[0]  # Choose first reshape ax so sl_ax decrement will go to new slice
                 else:
                     # Normal composition
                     new_dset_slices[targ] = self._compose_slice_pair(old_sl, rshp_slices[sl_ax])
@@ -490,6 +510,10 @@ class DatasetView(metaclass=ABCMeta):
             new_axis_map.remove(dt)
             new_axis_map = [_ if _ < dt else _ - 1 for _ in new_axis_map]
 
+        # Restore integer entries from self._dset_slices
+        new_dset_slices = [new_dset_slices[dset_sl_idx.index(ix)] if ix in dset_sl_idx else orig
+                           for ix, orig in enumerate(self._dset_slices)]
+
         return new_dset_slices, new_reshape, new_axis_map
 
     def dsetread(self):
@@ -522,7 +546,10 @@ class DatasetView(metaclass=ABCMeta):
         if axis_order is None:
             axis_order = tuple(reversed(range(len(self._axis_map))))
 
-        return DatasetView(self.dataset, self._dset_slices, self._sliced_reshape, axis_order)
+        new_axis_map = [self._axis_map[_] if _ < len(self._axis_map) else _ for _ in axis_order]
+
+        return DatasetView(self.dataset, dataset_slices=self._dset_slices, sliced_reshape=self._sliced_reshape,
+                           axis_map=new_axis_map)
 
     def transpose(self, axis_order=None):
         return self.lazy_transpose(axis_order=axis_order)
@@ -605,7 +632,8 @@ class DatasetView(metaclass=ABCMeta):
         reshape_targets, reshape_ok = self._map_shapes(new_shape)
 
         if not reshape_ok:
-            # TODO: logger.warning("reshape only supports even many-to-one merges or one-to-many splits. Try chaining multiple reshape operations.")
+            # TODO: logger.warning("reshape only supports even many-to-one merges or one-to-many splits.
+            #  Try chaining multiple reshape operations.")
             return self.dsetread().reshape(new_shape)
 
         # Map reshape operations back through _axis_map.
@@ -712,13 +740,38 @@ def lazy_transpose(dset: installed_dataset_types, axes=None):
 class DatasetViewh5py(DatasetView, h5py.Dataset):
 
     def __new__(cls, dataset):
-
         _self = super().__new__(cls)
         h5py.Dataset.__init__(_self, dataset.id)
+        # _self._dataset = h5py.Dataset(dataset.id)
         return _self
 
     def __getnewargs__(self):
         return (self._dataset,)
+
+    @classmethod
+    def on_finalize(cls, fileobj, fname):
+        fileobj.close()
+        try:
+            os.remove(fname)
+        except FileNotFoundError:
+            # The file no longer exists. There's probably a good reason for that.
+            pass
+
+    def get_writable_copy(self, swmr_mode=False):
+        # We cannot simply re-open as writable without destroying data.
+        # Instead we need to open a new temporary file.
+        # We co-opt the tempfile module to create the tempfile for us. Unfortunately h5pickle doesn't support
+        # file-like objects so we have to close this tempfile and pass its filename to h5 File()
+        tf = tempfile.NamedTemporaryFile(delete=False)
+        tf.close()
+        f = h5py.File(tf.name, mode='w', libver='latest')
+        self._dataset.parent.copy('data', f)
+        if swmr_mode:
+            f.swmr_mode = True
+        new_copy = DatasetView(f['data'], self._dset_slices, self._sliced_reshape, self._axis_map)
+        # Setup an automatic deleter for the new tempfile
+        new_copy._finalizer = weakref.finalize(new_copy, new_copy.on_finalize, f, f.filename)
+        return new_copy
 
 
 try:
