@@ -7,7 +7,7 @@ import tempfile
 from functools import wraps
 import h5py
 import zarr
-import pytest
+
 
 # Define decorator to iterate over dset_list
 def dset_iterator(f):
@@ -17,76 +17,77 @@ def dset_iterator(f):
             f(self, *args, **kwargs)
     return wrapper
 
+
 class LazyOpsBase(object):
 
     srand = secrets.SystemRandom()
 
     @classmethod
-    def _slices(cls,shape):
-        ''' find an appropriate tuple of slices '''
+    def _slices(cls, shape):
+        """ find an appropriate tuple of slices """
         return tuple(slice(cls.srand.randint(~s-1, s+1), cls.srand.randint(~s-1, s+1),
-                            cls.srand.randint(1, s)) for s in shape)
+                           cls.srand.randint(1, s)) for s in shape)
 
     @classmethod
-    def _axis(cls,n):
-        ''' find an appropriate tuple of axes given number of dimensions '''
+    def _axis(cls, n):
+        """ find an appropriate tuple of axes given number of dimensions """
         axes = list(range(n))
         cls.srand.shuffle(axes)
         return axes
 
     @classmethod
-    def _int_indexing(cls,shape):
-        ''' find an appropriate tuple of integers '''
+    def _int_indexing(cls, shape):
+        """ find an appropriate tuple of integers """
         return tuple(cls.srand.randint(0, s-1) for s in shape)
 
     @classmethod
-    def _array_indexing(cls,shape):
-        ''' find an appropriate tuple with a single array index '''
-        single_array_dim = cls.srand.randrange(0,len(shape))
-        single_array_len = cls.srand.randrange(0,shape[single_array_dim])
+    def _array_indexing(cls, shape):
+        """ find an appropriate tuple with a single array index """
+        single_array_dim = cls.srand.randrange(0, len(shape))
+        single_array_len = cls.srand.randrange(0, shape[single_array_dim])
         single_array_indexing = sorted(cls.srand.sample(range(shape[single_array_dim]),
                                                         single_array_len))
-        return tuple(slice(None,None,None) if i != single_array_dim else single_array_indexing
+        return tuple(slice(None, None, None) if i != single_array_dim else single_array_indexing
                      for i in range(len(shape)))
 
     @classmethod
-    def _bool_indexing(cls,shape):
-        ''' find an appropriate tuple with a single array index '''
-        single_array_dim = cls.srand.randrange(0,len(shape))
+    def _bool_indexing(cls, shape):
+        """ find an appropriate tuple with a single array index """
+        single_array_dim = cls.srand.randrange(0, len(shape))
         single_bool_indexing = np.array(cls.srand.choices([True,False], k=shape[single_array_dim]))
-        return tuple(slice(None,None,None) if i != single_array_dim else single_bool_indexing
+        return tuple(slice(None, None, None) if i != single_array_dim else single_bool_indexing
                      for i in range(len(shape)))
 
     @classmethod
-    def _slices_and_int(cls,shape):
-        ''' find an appropriate tuple of slices and integers '''
+    def _slices_and_int(cls, shape):
+        """ find an appropriate tuple of slices and integers """
         return tuple(slice(cls.srand.randint(~s-1, s+1), cls.srand.randint(~s-1, s+1),
                            cls.srand.randint(1, s))
-                           if cls.srand.choice([True, False]) else
-                           cls.srand.randint(0, s-1)
-                           for s in shape)
+                     if cls.srand.choice([True, False]) else
+                     cls.srand.randint(0, s-1)
+                     for s in shape)
 
     @classmethod
-    def _slices_and_array(cls,shape, single_array_dim):
-        ''' find an appropriate tuple of slices and a single array index'''
-        single_array_len = cls.srand.randrange(0,shape[single_array_dim])
+    def _slices_and_array(cls, shape, single_array_dim):
+        """ find an appropriate tuple of slices and a single array index"""
+        single_array_len = cls.srand.randrange(0, shape[single_array_dim])
         single_array_indexing = sorted(cls.srand.sample(range(shape[single_array_dim]),
                                                         single_array_len))
         return tuple(slice(cls.srand.randint(~s-1, s+1), cls.srand.randint(~s-1, s+1),
                            cls.srand.randint(1, s))
-                           if i != single_array_dim else
-                           single_array_indexing
-                           for i, s in enumerate(shape))
+                     if i != single_array_dim else
+                     single_array_indexing
+                     for i, s in enumerate(shape))
 
     @classmethod
-    def _slices_and_bool(cls,shape, single_array_dim):
-        ''' find an appropriate tuple of slices and a single array index'''
-        single_bool_indexing = np.array(cls.srand.choices([True,False], k=shape[single_array_dim]))
+    def _slices_and_bool(cls, shape, single_array_dim):
+        """ find an appropriate tuple of slices and a single array index"""
+        single_bool_indexing = np.array(cls.srand.choices([True, False], k=shape[single_array_dim]))
         return tuple(slice(cls.srand.randint(~s-1, s+1), cls.srand.randint(~s-1, s+1),
                            cls.srand.randint(1, s))
-                           if i != single_array_dim else
-                           single_bool_indexing
-                           for i, s in enumerate(shape))
+                     if i != single_array_dim else
+                     single_bool_indexing
+                     for i, s in enumerate(shape))
 
 
     ##########################################
@@ -101,9 +102,9 @@ class LazyOpsBase(object):
     @dset_iterator
     def test_dsetview_nonlazy_slicing(self):
         # test __getitem__ read
-        assert_array_equal(self.dset,self.dsetview[()])
+        assert_array_equal(self.dset, self.dsetview[()])
         # test __getitem__ single slice read
-        assert_array_equal(self.dset,self.dsetview[:])
+        assert_array_equal(self.dset, self.dsetview[:])
         slices = self._slices(self.dset.shape)
         assert_array_equal(self.dset[slices], self.dsetview[slices])
 
@@ -143,8 +144,8 @@ class LazyOpsBase(object):
     @dset_iterator
     def test_dsetview_lazy_iter(self):
         for axis in range(len(self.dset.shape)):
-            for i,dsetview_lazy_i in enumerate(self.dsetview.lazy_iter(axis = axis)):
-                assert_array_equal(self.dset[(*np.index_exp[:]*axis,i)], dsetview_lazy_i)
+            for i, dsetview_lazy_i in enumerate(self.dsetview.lazy_iter(axis=axis)):
+                assert_array_equal(self.dset[(*np.index_exp[:]*axis, i)], dsetview_lazy_i)
 
     @dset_iterator
     def test_dsetview_lazy_transpose(self):
@@ -230,20 +231,20 @@ class LazyOpsBase(object):
 
     @classmethod
     def _dsetview_multi_lazy_ops_with_slice_indexing(cls, dset, dsetview, remaining_transpose_calls):
-        for num_slice_dims in range(1, len(dset.shape)+1):
+        for num_slice_dims in range(1, len(dset.shape) + 1):
             slices = cls._slices(dset.shape[:num_slice_dims])
             dset_new = dset[slices]
             dsetview_new = dsetview.lazy_slice[slices]
             # test __getitem__ read after lazy_slice
             # for lower and all dimensions
-            assert_array_equal(dset_new,dsetview_new)
+            assert_array_equal(dset_new, dsetview_new)
             if np.prod(dset_new.shape) != 0:
-                cls._dsetview_multi_lazy_ops_with_slice_indexing(dset_new,dsetview_new, remaining_transpose_calls)
+                cls._dsetview_multi_lazy_ops_with_slice_indexing(dset_new, dsetview_new, remaining_transpose_calls)
         axis = cls._axis(len(dset.shape))
         dset_new = dset[()].transpose(axis)
         dsetview_new = dsetview.lazy_transpose(axis)
         # test DatasetView.lazy_transpose
-        assert_array_equal(dset_new,dsetview_new)
+        assert_array_equal(dset_new, dsetview_new)
         if remaining_transpose_calls > 0:
             cls._dsetview_multi_lazy_ops_with_slice_indexing(dset_new, dsetview_new, remaining_transpose_calls - 1)
 
@@ -254,7 +255,7 @@ class LazyOpsBase(object):
 
     @classmethod
     def _dsetview_multi_lazy_ops_with_slice_and_int_indexing(cls, dset, dsetview):
-        for num_slice_dims in range(1, len(dset.shape)+1):
+        for num_slice_dims in range(1, len(dset.shape) + 1):
             slices = cls._slices_and_int(dset.shape[:num_slice_dims])
             dset_new = dset[slices]
             dsetview_new = dsetview.lazy_slice[slices]
@@ -264,6 +265,7 @@ class LazyOpsBase(object):
             assert_array_equal(dset_new, dsetview_new)
             if np.prod(dset_new.shape) != 0:
                 cls._dsetview_multi_lazy_ops_with_slice_and_int_indexing(dset_new, dsetview_new)
+
 
 class LazyOpsBaseh5py(object):
 
@@ -347,17 +349,18 @@ class LazyOpsBaseh5py(object):
             if np.prod(dset_new.shape) != 0 and remaining_slice_calls > 0:
                 cls._dsetview_multi_lazy_slice_with_slice_and_bool_indexing(dset_new, dsetview_new, remaining_slice_calls - 1, array_dim)
 
-class LazyOpszarrTest(LazyOpsBase,unittest.TestCase):
-    ''' Class zarr array equality test '''
+
+class LazyOpszarrTest(LazyOpsBase, unittest.TestCase):
+    """ Class zarr array equality test """
 
     def setUp(self):
-        self.ndims = 7
+        ndims = 7
         num_datasets = 3
 
         self.temp_dir_zarr = tempfile.TemporaryDirectory(suffix=".zgroup")
         self.zarr_group = zarr.group(store=self.temp_dir_zarr.name, overwrite=True)
         self.dset_list = list(self.zarr_group.create_dataset(name='zarray'+str(i),
-                              data=np.random.rand(*self.srand.choices(range(1, 90//self.ndims), k=self.ndims)))
+                              data=np.random.rand(*self.srand.choices(range(1, 90//ndims), k=ndims)))
                               for i in range(num_datasets))
         self.dsetview_list = list(DatasetView(self.dset_list[i]) for i in range(num_datasets))
         print(LazyOpszarrTest)
@@ -365,18 +368,19 @@ class LazyOpszarrTest(LazyOpsBase,unittest.TestCase):
     def tearDown(self):
         self.temp_dir_zarr.cleanup()
 
-class LazyOpsh5pyTest(LazyOpsBase,LazyOpsBaseh5py,unittest.TestCase):
-    ''' Class h5py dataset array equality test '''
+
+class LazyOpsh5pyTest(LazyOpsBase, LazyOpsBaseh5py, unittest.TestCase):
+    """ Class h5py dataset array equality test """
 
     def setUp(self):
         self.temp_file = tempfile.NamedTemporaryFile(suffix=".hdf5", delete=False)
         self.temp_file.close()
-        self.h5py_file = h5py.File(self.temp_file.name,'w')
+        self.h5py_file = h5py.File(self.temp_file.name, 'w')
 
-        self.ndims = 7
+        ndims = 7
         num_datasets = 3
-        self.dset_list = list(self.h5py_file.create_dataset(name='dset'+str(i),
-                              data=np.random.rand(*self.srand.choices(range(1, 90//self.ndims), k=self.ndims)))
+        self.dset_list = list(self.h5py_file.create_dataset(name='dset' + str(i),
+                              data=np.random.rand(*self.srand.choices(range(1, 90 // ndims), k=ndims)))
                               for i in range(num_datasets))
         self.dsetview_list = list(DatasetView(self.dset_list[i]) for i in range(num_datasets))
 
