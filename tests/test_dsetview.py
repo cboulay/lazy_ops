@@ -6,6 +6,7 @@ import unittest
 import tempfile
 from functools import wraps
 import h5py
+import h5pickle
 import zarr
 
 
@@ -348,6 +349,39 @@ class LazyOpsBaseh5py(object):
             assert_array_equal(dset_new, dsetview_new)
             if np.prod(dset_new.shape) != 0 and remaining_slice_calls > 0:
                 cls._dsetview_multi_lazy_slice_with_slice_and_bool_indexing(dset_new, dsetview_new, remaining_slice_calls - 1, array_dim)
+
+
+class LazyOpsh5pickleTest(unittest.TestCase):
+
+    def setUp(self):
+        self.temp_file = tempfile.NamedTemporaryFile(suffix=".hdf5", delete=False)
+        self.temp_file.close()
+        h5py_file = h5py.File(self.temp_file.name, 'w')
+        ndims = 7
+        srand = secrets.SystemRandom()
+        data = np.random.rand(*srand.choices(range(1, 90 // ndims), k=ndims))
+        h5py_file.create_dataset(name='dset', data=data)
+        h5py_file.close()
+
+        self.h5pkl_file = h5pickle.File(self.temp_file.name, 'r')
+        self.dset = self.h5pkl_file['/dset']
+        self.dsetview = DatasetView(self.dset)
+
+    def tearDown(self):
+        self.temp_file.delete = True
+        self.temp_file.close()
+
+    def test_pkl_dset(self):
+        """ Assert that pickling dset works."""
+        import pickle
+        dset_copy = pickle.loads(pickle.dumps(self.dset))
+        assert_array_equal(self.dset, dset_copy)
+
+    def test_pkl_dsetview(self):
+        import pickle
+        dsetview_copy = pickle.loads(pickle.dumps(self.dsetview))
+        assert_array_equal(self.dsetview, dsetview_copy)
+        assert_array_equal(self.dsetview.lazy_slice[..., 0], dsetview_copy[..., 0])
 
 
 class LazyOpszarrTest(LazyOpsBase, unittest.TestCase):
