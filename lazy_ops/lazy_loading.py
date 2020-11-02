@@ -69,34 +69,33 @@ class DatasetView(metaclass=ABCMeta):
         (reshaping) results in an axis with length=1 then it is likely that axis should be retained in the output.
 
     TODO: Maybe someday _sliced_reshape and _axis_map can be reimplemented with something like
-    numpy's strides, and this can be even more flexible.
+     numpy's strides, and this can be even more flexible.
     """
 
-    def __new__(cls,
-                dataset: installed_dataset_types = None,
-                dataset_slices=np.index_exp[:],
-                sliced_reshape=None,
-                axis_map=None):
+    def __new__(cls, dataset: installed_dataset_types = None, **kwargs):
         """
+        Co-opt DatasetView new object allocation method to work as a factory function.
+        Allocate and return a new object of the subclass appropriate for the dataset type.
         Args:
           dataset: the underlying dataset
-          dataset_slices: see class docstring
-          sliced_reshape: see class docstring
-          axis_map: see class docstring
+          other kwargs for the __init__ function.
         Returns:
           lazy object
         """
         if cls == DatasetView:
             if isinstance(dataset, (h5py.Dataset, _h5py.Dataset)):
-                return DatasetViewh5py(dataset=dataset)
+                return DatasetViewh5py(dataset=dataset, **kwargs)
             elif HAVE_ZARR:
                 if isinstance(dataset, zarr.core.Array):
-                    return DatasetViewzarr(dataset=dataset)
-            elif str(z1).find("zarr") != -1:  # TODO: What is z1?
-                raise TypeError("To use DatasetView with a zarr array install zarr: \n pip install zarr\n")
+                    return DatasetViewzarr(dataset=dataset, **kwargs)
             raise TypeError("DatasetView requires either an h5py dataset or a zarr array as first argument")
         else:
             return super().__new__(cls)
+
+    def __getnewargs_ex__(self):
+        # Someone is about to make a copy of us. We need to reopen as read-only.
+        self.make_copyable()
+        return (), self.state
 
     def __init__(self,
                  dataset: installed_dataset_types = None,
@@ -104,6 +103,7 @@ class DatasetView(metaclass=ABCMeta):
                  sliced_reshape=None,
                  axis_map=None):
         """
+        This initializer is only called after the subclass initializer.
         Args:
           dataset: the underlying dataset
           sliced_reshape: See class docstring
@@ -111,26 +111,21 @@ class DatasetView(metaclass=ABCMeta):
         """
         self._lazy_slice_call = False  # If True then the next slice will return a view
         self._dataset = dataset
+        self._is_file_owner = False
+        self._using_tempfile = False
+        self._filename = None
+        self._refresh_filename()  # Depends on dataset type
         self._dset_slices = self._sanitize_slices(dataset_slices)
-        self._sliced_shape = None  # Shape of sliced dataset
-        self._calculate_sliced_shape()
-        self._sliced_reshape = sliced_reshape if sliced_reshape is not None else self._sliced_shape
+        self._sliced_reshape = sliced_reshape if sliced_reshape is not None else self.sliced_shape
         self._axis_map = list(axis_map) if axis_map is not None else list(range(len(self._sliced_reshape)))
-        self._shape = tuple([self._sliced_reshape[_] for _ in self._axis_map])
 
-    def __getstate__(self):
-        """Save the current name and a reference to the root file object."""
-        save_state = {
-            'dataset': self._dataset,
-            'dataset_slices': self._dset_slices,
-            'sliced_reshape': self._sliced_reshape,
-            'axis_map': self._axis_map
-        }
-        return save_state
-
-    def __setstate__(self, state):
-        """File is reopened by pickle. Create a dataset and steal its identity"""
-        self.__init__(**state)
+    # def __setstate__(self, state):
+    #     """File is reopened by pickle. Create a dataset and steal its identity"""
+    #     init_kwargs = {'dataset': state['dataset'],
+    #                    'dataset_slices': state['_dset_slices'],
+    #                    'sliced_reshape': state['_sliced_reshape'],
+    #                    'axis_map': state['_axis_map']}
+    #     self.__init__(**init_kwargs)
 
     def _sanitize_slices(self, slices_):
         slices_ = self._slice_tuple(slices_)                              # Ensure tuple
@@ -150,12 +145,19 @@ class DatasetView(metaclass=ABCMeta):
             sl_size = len(sl)
         return sl_size
 
-    def _calculate_sliced_shape(self):
+    @property
+    def state(self):
+        """State variables in a dict with keys renamed to match __new__/__init__ signature."""
+        return {'dataset': self._dataset, 'dataset_slices': self._dset_slices,
+                'sliced_reshape': self._sliced_reshape, 'axis_map': self._axis_map}
+
+    @property
+    def sliced_shape(self):
         sl_dset_shape = [self._slice_size(_) for _ in self._dset_slices]
         sl_dset_shape = [_ for _ in sl_dset_shape if _ is not None]  # Drop integer slices from shape
         # Add on trailing yet-to-be-sliced dimensions
         sl_dset_shape.extend(self.dataset.shape[len(self._dset_slices):])
-        self._sliced_shape = tuple(sl_dset_shape)
+        return tuple(sl_dset_shape)
 
     @property
     def lazy_slice(self):
@@ -169,11 +171,7 @@ class DatasetView(metaclass=ABCMeta):
 
     @property
     def shape(self):
-        if self._shape is None:
-            self._calculate_sliced_shape()
-            # TODO: Check self._sliced_reshape is not None
-            self._shape = tuple([self._sliced_reshape[_] for _ in self._axis_map])
-        return self._shape
+        return tuple([self._sliced_reshape[_] for _ in self._axis_map])
 
     def __len__(self):
         return self.len()
@@ -189,17 +187,34 @@ class DatasetView(metaclass=ABCMeta):
     def size(self):
         return np.prod(self.shape)
 
-    # @property
-    # def dtype(self):
-    #     return self._dataset.dtype
+    @property
+    def dtype(self):
+        return self._dataset.dtype
 
-    # @property
-    # def id(self):
-    #     return self._dataset.id
+    @property
+    def id(self):
+        return self._dataset.id
+
+    def __iter__(self):
+        return iter(self._dataset)
 
     @abstractmethod
-    def get_writable_copy(self):
-        # Must be implemented in sub-classes.
+    def make_copyable(self):
+        """Change the file mode so it is safe to copy."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def move_or_copy_file(self, new_path, mode='r'):
+        raise NotImplementedError
+
+    @property
+    def using_tempfile(self):
+        """Return boolean to indicate file is a tempfile.
+        This could be used to greenlight rename or delete operations."""
+        return self._using_tempfile
+
+    @abstractmethod
+    def _refresh_filename(self):
         raise NotImplementedError
 
     @classmethod
@@ -320,14 +335,14 @@ class DatasetView(metaclass=ABCMeta):
         # So we need to transform new value to get it suitable for updating dest_obj
         dest_obj = self.lazy_slice[new_slices]
         value = value.transpose(np.argsort(dest_obj._axis_map))  # inverse-transpose
-        value = value.reshape(dest_obj._sliced_shape)  # Reshape
+        value = value.reshape(dest_obj.sliced_shape)  # Reshape
         dest_obj._dataset[dest_obj._dset_slices] = value[:]
 
     def lazy_iter(self, axis=0):
         """ lazy iterator over the first axis
             Modifications to the items are not stored
         """
-        for ix in range(self._shape[axis]):
+        for ix in range(self.shape[axis]):
             yield self.lazy_slice[(*np.index_exp[:]*axis, ix)]
 
     def __call__(self, new_slice):
@@ -340,6 +355,27 @@ class DatasetView(metaclass=ABCMeta):
             old_len = cls._slice_size(old_sl)
             if old_len is None:  # integer
                 old_len = 1
+
+        # Attempt to convert new_sl into a slice object. This will save a lot of time if it works.
+        if not isinstance(new_sl, (slice, int)) and new_sl is not None:
+            # new_sl is an list/iterator of integers or list of booleans.
+            if len(new_sl) > 0 and all(isinstance(el, (type(True), np.bool_)) for el in new_sl):
+                # Convert boolean array to iterator of integers.
+                new_sl = np.array(new_sl)
+                if len(new_sl) != old_len:
+                    raise IndexError("Length of boolean index {} must be equal to axis size {}".format(
+                        len(new_sl), old_len))
+                new_sl = new_sl.nonzero()[0]
+            # Converting a list of integers to a slice would hide an out-of-range error
+            max_idx = np.max(new_sl)
+            if max_idx >= old_len or max_idx <= ~old_len:
+                raise IndexError("Index {} out of range, size {}".format(max_idx, old_len))
+
+            # Check if we can convert new_sl to slice obj
+            step_sizes = np.diff(new_sl) if len(new_sl) > 1 else [1]
+            if len(np.unique(step_sizes)) == 1:
+                # Can be converted!
+                new_sl = slice(new_sl[0], new_sl[-1] + 1, step_sizes[0])
 
         if isinstance(new_sl, slice):
             if isinstance(old_sl, slice):
@@ -361,29 +397,15 @@ class DatasetView(metaclass=ABCMeta):
         elif new_sl is None:
             print("This shouldn't be reached. Please notify devs if you see this.")
         else:
-            # new_sl is an list/iterator of integers or booleans.
-            if len(new_sl) > 0 and all(isinstance(el, (type(True), np.bool_)) for el in new_sl):
-                new_sl = np.array(new_sl)
-                # Convert boolean array to iterator of integers.
-                if len(new_sl) != old_len:
-                    raise IndexError("Length of boolean index {} must be equal to axis size {}".format(
-                        len(new_sl), old_len))
-                new_sl = new_sl.nonzero()[0]
-            if any(el >= old_len or el <= ~old_len for el in new_sl):
-                raise IndexError("Index {} out of range, of size {}".format(new_sl, old_len))
             if len(new_sl) == 0:
                 upd_sl = []
-            elif isinstance(old_sl, slice):
-                upd_sl = tuple(old_sl.start + old_sl.step * (ind % old_len)
-                               for ind in new_sl)
             else:
-                # old_sl is an iterator of integers
-                upd_sl = tuple(old_sl[ind] for ind in new_sl)
-            # If upd_sl is a long integer iterator with even step sizes then compress it to a slice object
-            step_sizes = np.diff(upd_sl)
-            if len(step_sizes) > 2 and len(np.unique(step_sizes)) == 1:
-                upd_sl = slice(upd_sl[0], upd_sl[-1] + 1, step_sizes[0])
-
+                # new_sl is still list of integers, despite our efforts to convert above.
+                if isinstance(old_sl, slice):
+                    upd_sl = tuple((old_sl.start + old_sl.step * np.array(new_sl) % old_len).tolist())
+                else:
+                    # both old_ and new_ are iterators of integers
+                    upd_sl = tuple(old_sl[ind] for ind in new_sl)
         return upd_sl
 
     def _compose_slices(self, new_slices):
@@ -418,7 +440,7 @@ class DatasetView(metaclass=ABCMeta):
         # inverse reshape:
         # This is tricky for axes that have been split or merged.
         # Instead of inverse reshape now, simply identify splits/merges then handle case-by-case during compose.
-        reshape_targets, reshape_ok = self._map_shapes(self._sliced_reshape, old_shape=self._sliced_shape)
+        reshape_targets, reshape_ok = self._map_shapes(self._sliced_reshape, old_shape=self.sliced_shape)
         assert reshape_ok, "It shouldn't be possible to trigger this."
 
         # Compose slices - in reverse order
@@ -462,7 +484,11 @@ class DatasetView(metaclass=ABCMeta):
                     rshp_idx = np.where(b_targ)[0]
                     old_sl_as_iter = self._slice2iter(old_sl)
                     old_iter_ = np.reshape(old_sl_as_iter, self._sliced_reshape[b_targ])
-                    new_iter_ = old_iter_[tuple(_ for ix, _ in enumerate(rshp_slices) if b_targ[ix])]
+                    sl_in_old_iter = []
+                    for old_rshp_ix, rshp_sl_ix in enumerate(np.where(b_targ)[0]):
+                        sl_in_old_iter.append(self._compose_slice_pair(slice(0, old_iter_.shape[old_rshp_ix], 1),
+                                                                       rshp_slices[rshp_sl_ix]))
+                    new_iter_ = old_iter_[tuple(sl_in_old_iter)]
                     new_dset_slices[targ] = new_iter_.flatten().tolist()
                     new_iter_ix = 0  # Index into new_iter_.shape, needed so we can skip int-indexed dimensions.
                     for r_ix in rshp_idx:
@@ -478,6 +504,15 @@ class DatasetView(metaclass=ABCMeta):
                     new_reshape[sl_ax] = self._slice_size(new_dset_slices[targ])  # <- None if slice is int
 
             sl_ax -= 1
+
+        # Even though we attempted to convert new_sl to a slice object during composition above,
+        #  it's possible that the composition result can be made a slice obj even if the individual components were not
+        #  So here we attempt to convert the resul to a slice object.
+        for sl_ax, sl in enumerate(new_dset_slices):
+            if not isinstance(sl, (slice, int)):
+                step_sizes = np.diff(sl) if len(sl) > 1 else [1]
+                if len(np.unique(step_sizes)) == 1:
+                    new_dset_slices[sl_ax] = slice(sl[0], sl[-1] + 1, step_sizes[0])
 
         # Update new_reshape and create new_axis_map
         # - expand axes where sl == None
@@ -521,6 +556,20 @@ class DatasetView(metaclass=ABCMeta):
         Returns:
           numpy array
         """
+        if False:
+            slices = list(self._dset_slices)
+            # h5 dataset slicing fails when more than one slice element is an iterable (vec/array/list/tuple).
+            # We can on-the-fly correct some instances when the iterable is len==1, converting that to a solitary
+            # integer. The loss of axis gets corrected during reshape.
+            b_sl_vec = [isinstance(_, (tuple, list)) for _ in slices]
+            if sum(b_sl_vec) > 1:
+                is_int = [len(_) == 1 if is_vec else None for _, is_vec in zip(slices, b_sl_vec)]
+                while any(is_int):
+                    int_idx = np.where(is_int)[0][-1]
+                    slices[int_idx] = slices[int_idx][0]
+                    is_int = [len(_) == 1 if isinstance(_, (tuple, list)) else None
+                              for _ in slices]
+            result = self.dataset[tuple(slices)]
         result = self.dataset[self._dset_slices]
         # Reshape if necessary
         if not np.array_equal(self._sliced_reshape, result.shape):
@@ -616,7 +665,9 @@ class DatasetView(metaclass=ABCMeta):
         # https://github.com/numpy/numpy/blob/master/numpy/core/src/multiarray/shape.c#L364
 
         if np.array_equal(new_shape, self.shape):
-            return DatasetView(self.dataset, self._dset_slices, self._sliced_reshape, self._axis_map)
+            return DatasetView(self.dataset, dataset_slices=self._dset_slices,
+                               sliced_reshape=self._sliced_reshape,
+                               axis_map=self._axis_map)
 
         new_shape = np.array(new_shape)
         if -1 in new_shape:
@@ -708,7 +759,7 @@ class DatasetView(metaclass=ABCMeta):
                 slice_shape += (1 + (sl.stop - sl.start - 1) // sl.step if sl.stop != sl.start else 0,)
                 axis_order += (self.axis_order[ix],)
             elif isinstance(sl, int):
-                int_index += ((i, sl, self.axis_order[ix]),)
+                int_index += ((ix, sl, self.axis_order[ix]),)  # ?
             else:
                 # slice_[i] is an iterator of integers
                 slice_shape += (len(sl),)
@@ -726,52 +777,172 @@ class DatasetView(metaclass=ABCMeta):
 def lazy_transpose(dset: installed_dataset_types, axes=None):
     """ Array lazy transposition, not passing axis argument reverses the order of dimensions
     Args:
-      dset: h5py dataset
+      dset: A (h5py/h5pickle/zarr) dataset object or a DatasetView object.
       axes: permutation order for transpose
     Returns:
       lazy transposed DatasetView object
     """
+    if not isinstance(dset, DatasetView):
+        dset = DatasetView(dset)
+
     if axes is None:
         axes = tuple(reversed(range(len(dset.shape))))
 
-    return DatasetView(dset).lazy_transpose(axis_order=axes)
+    return dset.lazy_transpose(axis_order=axes)
 
 
-class DatasetViewh5py(DatasetView, h5py.Dataset):
+class DatasetViewh5py(DatasetView):
 
-    def __new__(cls, dataset):
-        _self = super().__new__(cls)
-        h5py.Dataset.__init__(_self, dataset.id)
-        # _self._dataset = h5py.Dataset(dataset.id)
-        return _self
+    # def __init__(self, dataset: h5py.Dataset = None, **kwargs):
+    #     DatasetView.__init__(self, dataset=dataset, **kwargs)
 
-    def __getnewargs__(self):
-        return (self._dataset,)
+    def __getstate__(self):
+        """Get the state info we need to recreate the same object. Used by pickle and copy.
+
+        There are a few use cases for copy/pickle on a DatasetView:
+        1 - We want to use the data as a starting point and work on them without affecting the original.
+        2 - We want to shuttle the data to a subprocess. For example, we collect a list of multiple lazy-sliced
+            datasetviews then use pool.map() to process each item.
+        3 - We want to temporarily store the data.
+
+        In all cases, we do not want any modification to the copy to affect the original.
+
+        For case 1, the dataset needs to be copied to a new writable file.
+        For cases 2 and 3, we don't want to copy the whole file for each slice!
+
+        How do we know which scenario? Or, how do we know whether or not to copy the dataset to a new writable file?
+
+        Actually this raises another issue that must be dealt with first. If a file is writable-but-not-smr,
+        then it cannot be opened again, even read-only, so copying is impossible. Thus, in __getnewargs_ex__,
+        if we detect that the file is writable-but-not-swmr then we close it and reopen it as read-only.
+        It seems like pickling a swmr file is buggy so this too could prevent copying, so presently those
+        also get converted to read-only. i.e., currently all writable files are closed and re-opened as read-only
+        when we detect they are about to be copied or pickled.
+
+        If a file is already read-only (and hopefully swmr in the future), then __getnewargs_ex__ leaves it alone.
+
+        Whether or not to copy the file on disk is handled by __setstate__.
+        """
+        # Making the file read-only is handled by __getnewargs_ex__, which calls make_copyable.
+        state = self.__dict__.copy()
+        return state
+
+    def make_copyable(self):
+        if self._dataset.file.mode not in ('r',):  # TODO: Add None to tuple after swmr fixed.
+            fname = self._dataset.file.filename
+            dset_name = self._dataset.name
+            cache_settings = self._dataset.file.id.get_access_plist().get_cache()
+            self._dataset.file.close()
+            f = h5py.File(fname, mode='r', libver='latest',
+                          rdcc_nslots=cache_settings[1], rdcc_nbytes=cache_settings[2])
+            self._dataset = f[dset_name]
+
+    def __setstate__(self, state):
+        """
+        - If the file is read-only then we can't modify the dataset.
+            Make writable temporary files and reopent the dataset.
+        - If the file is swmr then we make read-only copies without making new files.
+
+        """
+        state['_is_file_owner'] = False
+        self.__dict__.update(state)
+        cache_settings = self._dataset.file.id.get_access_plist().get_cache()
+        if self._dataset.file.mode == 'r':
+            # At least until swmr is fixed,
+            # Every dataset's file should be read-only by this point.
+            # Assume we are making a copy because we want to modify it without affecting the original.
+            # So make a writable tempfile-backed copy of the dataset.
+            dset_name_in_parent = self._dataset.name.split('/')[-1]
+            f = TempH5PickleFile(rdcc_nbytes=cache_settings[2], rdcc_nslots=cache_settings[1])
+            self._dataset.parent.copy(dset_name_in_parent, f)
+            f.swmr_mode = True
+            self._dataset = f[dset_name_in_parent]
+            self._using_tempfile = True
+            self._is_file_owner = True
+            self._filename = f.name
+        else:
+            # swmr mode. Until swmr is fixed, this should never be triggered.
+            # When fixed, copies of swmr should be read-only.
+            fname = self._dataset.file.filename
+            dset_name = self._dataset.name
+            f = h5py.File(fname, mode='r', libver='latest',
+                          rdcc_nbytes=cache_settings[2], rdcc_nslots=cache_settings[1])
+            self._dataset = f[dset_name]
+
+    def _refresh_filename(self):
+        self._filename = self._dataset.file.filename
+
+    @property
+    def using_tempfile(self):
+        return self._using_tempfile
+
+    def move_or_copy_file(self, new_dset_path, mode='r'):
+        import shutil
+        from pathlib import Path
+        old_dset_path = self._dataset.file.filename
+        dset_name = self._dataset.name
+        cache_settings = self._dataset.file.id.get_access_plist().get_cache()
+        file_kwargs = {'rdcc_nbytes': cache_settings[2],
+                       'rdcc_nslots': cache_settings[1]}
+        self._dataset.flush()
+        self._dataset.file.close()
+        if self.using_tempfile:
+            # Backed by temp file so rename/move it.
+            if Path(old_dset_path).drive == Path(new_dset_path).drive:
+                # Can only use os.rename if on same disk. TODO: Does this need `(not Win) or` ?
+                os.rename(old_dset_path, new_dset_path)
+            else:
+                shutil.move(old_dset_path, new_dset_path)
+        else:
+            shutil.copy(old_dset_path, new_dset_path)
+        # Open the h5 file, now at the new location next to the cache file.
+        f = h5py.File(new_dset_path, mode=mode, libver='latest', **file_kwargs)
+        self._dataset = f[dset_name]  # TODO: Check f[dset_name].chunks
+
+class TempH5PickleFile(h5py.File):
+    def __new__(cls, *args, **kwargs):
+        # delete=False because we want to close and reopen, possibly multiple times.
+        tf = tempfile.NamedTemporaryFile(delete=False)
+        tf.close()
+        args = (tf.name,) + args[1:]
+
+        # Optionally, instead of __del__
+        # self._finalizer = weakref.finalize(self, cls_method.on_finalize, filename)
+        obj = super().__new__(cls, *args, **{'mode':'w', 'libver':'latest', **kwargs})
+        obj._tempfilename = tf.name
+        # obj._finalizer = weakref.finalize(obj, cls.on_finalize, tf.name)
+        return obj
 
     @classmethod
-    def on_finalize(cls, fileobj, fname):
-        fileobj.close()
+    def on_finalize(cls, fname):
         try:
             os.remove(fname)
         except FileNotFoundError:
-            # The file no longer exists. There's probably a good reason for that.
-            pass
+            print(f"Could not remove file when TempH5PickleFile obj went out of scope because"
+                  f"{fname} could not be found. "
+                  f"This could be harmless if the file was explicitly renamed as an efficient save.")
+        except PermissionError:
+            print(f"Could not remove file {fname} because of PermissionError.")
 
-    def get_writable_copy(self, swmr_mode=False):
-        # We cannot simply re-open as writable without destroying data.
-        # Instead we need to open a new temporary file.
-        # We co-opt the tempfile module to create the tempfile for us. Unfortunately h5pickle doesn't support
-        # file-like objects so we have to close this tempfile and pass its filename to h5 File()
-        tf = tempfile.NamedTemporaryFile(delete=False)
-        tf.close()
-        f = h5py.File(tf.name, mode='w', libver='latest')
-        self._dataset.parent.copy('data', f)
-        if swmr_mode:
-            f.swmr_mode = True
-        new_copy = DatasetView(f['data'], self._dset_slices, self._sliced_reshape, self._axis_map)
-        # Setup an automatic deleter for the new tempfile
-        new_copy._finalizer = weakref.finalize(new_copy, new_copy.on_finalize, f, f.filename)
-        return new_copy
+    def __del__(self):
+        fname = self._tempfilename
+        # self._finalizer.detach()
+        try:
+            self.close()
+        except:
+            pass
+        self.on_finalize(fname)
+
+
+def create_with_tempfile(shape, dtype=None, chunks=True, compression="gzip", **kwargs):
+    tf = TempH5PickleFile(**kwargs)
+    dset = tf.create_dataset('data', shape=shape, dtype=dtype, chunks=chunks, compression=compression)
+    tf.swmr_mode = True
+    view = DatasetView(dataset=dset)
+    view._using_tempfile = True
+    view._is_file_owner = True
+    view._filename = tf.name
+    return view
 
 
 try:

@@ -5,6 +5,9 @@ from numpy.testing import assert_array_equal
 import unittest
 import tempfile
 from functools import wraps
+import multiprocessing
+import pickle
+from copy import deepcopy
 import h5py
 import h5pickle
 import zarr
@@ -154,7 +157,7 @@ class LazyOpsBase(object):
         # test DatasetView.lazy_transpose
         assert_array_equal(self.dset[()].transpose(axis), self.dsetview.lazy_transpose(axis))
         # test lazy_ops.lazy_transpose
-        assert_array_equal(np.transpose(self.dset[()], axis),lazy_transpose(self.dsetview, axis))
+        assert_array_equal(np.transpose(self.dset[()], axis), lazy_transpose(self.dsetview, axis))
 
     ###########################################
     # tests for multiple lazy slice calls     #
@@ -371,17 +374,101 @@ class LazyOpsh5pickleTest(unittest.TestCase):
         self.temp_file.delete = True
         self.temp_file.close()
 
+    def test_deepcopy(self):
+        # File starts out as read-only. test deepcopy on read-only backed dataset.
+        dsetview_copy = deepcopy(self.dsetview)
+        assert_array_equal(dsetview_copy, self.dsetview)
+        self.assertIsNone(dsetview_copy._dataset.file.mode,
+                          "deepcopy of datasetview backed by file in read-only mode"
+                          "should return dataset backed by tempfile in swmr mode.")
+        self.assertEqual(self.dsetview._dataset.file.mode, "r",
+                         "deepcopy of datasetview backed by file in read-only mode "
+                         "should not change the mode of original file.")
+        self.assertNotEqual(self.dsetview._dataset.file.filename, dsetview_copy._dataset.file.filename,
+                            "deepcopy of dsetview backed by file in read-only mode "
+                            "should produce a new (temp) file.")
+
+    def test_deepcopy_writable(self):
+        # We need a writable copy to test...
+        # Use tempfile to create an empty file.
+        tf = tempfile.NamedTemporaryFile(delete=False)
+        tf.close()
+        # Copy dataset to tempfile.
+        f = h5pickle.File(tf.name, mode='w', libver='latest')
+        dset_name_in_parent = self.dsetview._dataset.name[len(self.dsetview._dataset.parent.name):]
+        self.dsetview._dataset.parent.copy(dset_name_in_parent, f)
+        writable_dataset = f[dset_name_in_parent]
+        writable_view = DatasetView(dataset=writable_dataset)
+        # Then deepcopy it.
+        dsetview_copy = deepcopy(writable_view)
+        # This reopens the original (writable_view)
+        assert_array_equal(dsetview_copy, writable_view)
+        self.assertEqual(writable_view._dataset.file.mode, "r",
+                         "deepcopy of writable datasetview "
+                         "should change the mode of original file to read-only.")
+        self.assertNotEqual(writable_view._dataset.file.filename, dsetview_copy._dataset.file.filename,
+                            "deepcopy of writable dsetview "
+                            "should produce a new (temp) file.")
+        import os
+        writable_view._dataset.file.close()
+        os.remove(tf.name)
+
     def test_pkl_dset(self):
-        """ Assert that pickling dset works."""
-        import pickle
+        """ Assert that h5pickle dset works."""
         dset_copy = pickle.loads(pickle.dumps(self.dset))
         assert_array_equal(self.dset, dset_copy)
 
     def test_pkl_dsetview(self):
-        import pickle
-        dsetview_copy = pickle.loads(pickle.dumps(self.dsetview))
-        assert_array_equal(self.dsetview, dsetview_copy)
-        assert_array_equal(self.dsetview.lazy_slice[..., 0], dsetview_copy[..., 0])
+        # Uses __getstate__ and __setstate__
+        dsetview_pkl = pickle.loads(pickle.dumps(self.dsetview))
+        assert_array_equal(self.dsetview, dsetview_pkl)
+        assert_array_equal(self.dsetview.lazy_slice[..., 0], dsetview_pkl[..., 0])
+
+    def test_pkl_slices(self):
+        # Uses __getstate__ and __setstate__
+        slice_tuple = (slice(0, 2, 1), slice(None), 0)
+        sliced_view = self.dsetview.lazy_slice[slice_tuple]
+        pkl_sliced_view = pickle.loads(pickle.dumps(sliced_view))
+        assert_array_equal(self.dset[slice_tuple], pkl_sliced_view)
+
+    # Multiprocessing Tests #
+    #########################
+    # Multiprocessing is currently very inefficient because it makes a full on-disk
+    # copy for every pickled view. This should be much better when swmr is fixed;
+    # by detecting swmr we can know to open a read-only copy of the file.
+    # Unfortunately, for now having the original file open in swmr prevents it
+    # from being passed through to subprocesses.
+
+    def test_multiproc(self):
+        list_of_slice_tuples = [(slice(None),), (slice(0, 2, 1), slice(None), 0)]
+        n_procs = min(multiprocessing.cpu_count(), len(list_of_slice_tuples))
+        dset_view_doublets = [(self.dset[_], self.dsetview.lazy_slice[_])
+                              for _ in list_of_slice_tuples]
+        with multiprocessing.Pool(processes=n_procs) as pool:
+            results = pool.starmap(compare_dset_and_view, dset_view_doublets)
+        assert all(results)
+
+    # This next test is very slow if the above test is run first. I don't know why.
+    # Also currently buggy.
+    '''
+    def test_multiproc_writable(self):
+        # Purposely make a deepcopy of dsetview so we get a tmp file in swmr mode.
+        # When swmr is fixed, this should be more efficient because no on-disk copies are made.
+        swmr = deepcopy(self.dsetview)
+        list_of_slice_tuples = [(slice(None),), (slice(0, 2, 1), slice(None), 0)]
+        n_procs = min(multiprocessing.cpu_count(), len(list_of_slice_tuples))
+        dset_view_doublets = [(self.dset[_], swmr.lazy_slice[_])
+                              for _ in list_of_slice_tuples]
+        swmr.make_copyable()  # Necessary for now :/
+        with multiprocessing.Pool(processes=n_procs) as pool:
+            results = pool.starmap(compare_dset_and_view, dset_view_doublets)
+        assert all(results)
+    '''
+
+
+def compare_dset_and_view(dset, view):
+    """ Global-scope func for multiproc"""
+    return np.array_equal(dset, view)
 
 
 class LazyOpszarrTest(LazyOpsBase, unittest.TestCase):
